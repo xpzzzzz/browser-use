@@ -10,6 +10,17 @@ from browser_use.evidence.claim_extractor import (
 from browser_use.evidence.claims import Claim, ClaimSet
 from browser_use.evidence.collector import EvidenceCollector
 from browser_use.evidence.models import EvidenceNode
+from browser_use.evidence.organization import (
+	ClaimEvidenceEdge,
+	ClaimGraphNode,
+	EvidenceEdgeType,
+	EvidenceEvidenceEdge,
+	EvidenceGraph,
+	EvidenceGraphNode,
+	EvidenceGraphStats,
+	EvidenceOrganizationError,
+	EvidenceOrganizer,
+)
 from browser_use.evidence.reranking import (
 	ClaimReranking,
 	EvidenceRerankingError,
@@ -36,6 +47,8 @@ __all__ = [
 	'ClaimAlignment',
 	'ClaimExtractor',
 	'ClaimExtractionError',
+	'ClaimEvidenceEdge',
+	'ClaimGraphNode',
 	'ClaimReranking',
 	'ClaimSet',
 	'ClaimVerification',
@@ -48,6 +61,13 @@ __all__ = [
 	'EvidenceNode',
 	'EvidenceRerankingError',
 	'EvidenceRelation',
+	'EvidenceEdgeType',
+	'EvidenceEvidenceEdge',
+	'EvidenceGraph',
+	'EvidenceGraphNode',
+	'EvidenceGraphStats',
+	'EvidenceOrganizationError',
+	'EvidenceOrganizer',
 	'JsonlEvidenceStore',
 	'RawSemanticEvidenceScore',
 	'RawSemanticReranking',
