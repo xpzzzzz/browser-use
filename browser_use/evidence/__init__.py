@@ -25,6 +25,21 @@ from browser_use.evidence.claim_extractor import (
 )
 from browser_use.evidence.claims import Claim, ClaimSet
 from browser_use.evidence.collector import EvidenceCollector
+from browser_use.evidence.e2e_benchmark import (
+	AnswerCheck,
+	AnswerMatchMode,
+	BrowserBenchmarkCase,
+	BrowserBenchmarkError,
+	BrowserBenchmarkFailureStage,
+	BrowserBenchmarkRunResult,
+	BrowserBenchmarkSummary,
+	EvidenceBrowserBenchmarkResult,
+	evaluate_answer,
+	load_browser_benchmark_cases,
+	normalize_answer_text,
+	run_result_with_pipeline,
+	summarize_browser_runs,
+)
 from browser_use.evidence.models import EvidenceNode
 from browser_use.evidence.organization import (
 	ClaimEvidenceEdge,
@@ -75,6 +90,13 @@ from browser_use.evidence.verification import (
 
 __all__ = [
 	'AlignmentResult',
+	'AnswerCheck',
+	'AnswerMatchMode',
+	'BrowserBenchmarkCase',
+	'BrowserBenchmarkError',
+	'BrowserBenchmarkFailureStage',
+	'BrowserBenchmarkRunResult',
+	'BrowserBenchmarkSummary',
 	'BenchmarkRunCaseResult',
 	'BenchmarkStage',
 	'BenchmarkSummary',
@@ -91,6 +113,7 @@ __all__ = [
 	'ClaimVerifier',
 	'EvidenceAligner',
 	'EvidenceAssessment',
+	'EvidenceBrowserBenchmarkResult',
 	'EvidenceBenchmarkCase',
 	'EvidenceBenchmarkError',
 	'EvidenceBenchmarkExecutionError',
@@ -100,7 +123,10 @@ __all__ = [
 	'GoldEvidenceLabel',
 	'confusion_matrix',
 	'derive_gold_status',
+	'evaluate_answer',
 	'hit_metrics',
+	'load_browser_benchmark_cases',
+	'normalize_answer_text',
 	'EvidenceMatch',
 	'EvidenceNode',
 	'EvidenceRerankingError',
@@ -120,6 +146,8 @@ __all__ = [
 	'MarkdownReportRenderer',
 	'load_benchmark_cases',
 	'macro_f1',
+	'run_result_with_pipeline',
+	'summarize_browser_runs',
 	'RawSemanticEvidenceScore',
 	'RawSemanticReranking',
 	'RawClaim',
