@@ -20,6 +20,15 @@ from browser_use.evidence.reranking import (
 	SemanticEvidenceReranker,
 )
 from browser_use.evidence.store import JsonlEvidenceStore
+from browser_use.evidence.verification import (
+	ClaimVerification,
+	ClaimVerificationError,
+	ClaimVerifier,
+	EvidenceAssessment,
+	EvidenceRelation,
+	VerificationResult,
+	VerificationStatus,
+)
 
 __all__ = [
 	'AlignmentResult',
@@ -29,11 +38,16 @@ __all__ = [
 	'ClaimExtractionError',
 	'ClaimReranking',
 	'ClaimSet',
+	'ClaimVerification',
+	'ClaimVerificationError',
+	'ClaimVerifier',
 	'EvidenceAligner',
+	'EvidenceAssessment',
 	'EvidenceCollector',
 	'EvidenceMatch',
 	'EvidenceNode',
 	'EvidenceRerankingError',
+	'EvidenceRelation',
 	'JsonlEvidenceStore',
 	'RawSemanticEvidenceScore',
 	'RawSemanticReranking',
@@ -42,4 +56,6 @@ __all__ = [
 	'RerankedEvidenceMatch',
 	'RerankingResult',
 	'SemanticEvidenceReranker',
+	'VerificationResult',
+	'VerificationStatus',
 ]
