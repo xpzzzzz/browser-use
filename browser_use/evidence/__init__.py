@@ -21,6 +21,12 @@ from browser_use.evidence.organization import (
 	EvidenceOrganizationError,
 	EvidenceOrganizer,
 )
+from browser_use.evidence.pipeline import (
+	PipelineStage,
+	WebEvidencePipeline,
+	WebEvidencePipelineError,
+	WebEvidencePipelineResult,
+)
 from browser_use.evidence.reporting import (
 	ClaimReportSection,
 	EvidenceGroundedReport,
@@ -81,6 +87,7 @@ __all__ = [
 	'EvidenceOrganizer',
 	'EvidenceReportBuilder',
 	'EvidenceReportError',
+	'PipelineStage',
 	'JsonlEvidenceStore',
 	'MarkdownReportRenderer',
 	'RawSemanticEvidenceScore',
@@ -96,4 +103,7 @@ __all__ = [
 	'ClaimReportSection',
 	'VerificationResult',
 	'VerificationStatus',
+	'WebEvidencePipeline',
+	'WebEvidencePipelineError',
+	'WebEvidencePipelineResult',
 ]
