@@ -1,6 +1,22 @@
 """Evidence data layer for the WebEvidence research agent."""
 
 from browser_use.evidence.alignment import AlignmentResult, ClaimAlignment, EvidenceAligner, EvidenceMatch
+from browser_use.evidence.benchmark import (
+	BenchmarkRunCaseResult,
+	BenchmarkStage,
+	BenchmarkSummary,
+	EvidenceBenchmarkCase,
+	EvidenceBenchmarkError,
+	EvidenceBenchmarkExecutionError,
+	EvidenceBenchmarkResult,
+	EvidenceBenchmarkRunner,
+	GoldEvidenceLabel,
+	confusion_matrix,
+	derive_gold_status,
+	hit_metrics,
+	load_benchmark_cases,
+	macro_f1,
+)
 from browser_use.evidence.claim_extractor import (
 	ClaimExtractionError,
 	ClaimExtractor,
@@ -59,6 +75,9 @@ from browser_use.evidence.verification import (
 
 __all__ = [
 	'AlignmentResult',
+	'BenchmarkRunCaseResult',
+	'BenchmarkStage',
+	'BenchmarkSummary',
 	'Claim',
 	'ClaimAlignment',
 	'ClaimExtractor',
@@ -72,7 +91,16 @@ __all__ = [
 	'ClaimVerifier',
 	'EvidenceAligner',
 	'EvidenceAssessment',
+	'EvidenceBenchmarkCase',
+	'EvidenceBenchmarkError',
+	'EvidenceBenchmarkExecutionError',
+	'EvidenceBenchmarkResult',
+	'EvidenceBenchmarkRunner',
 	'EvidenceCollector',
+	'GoldEvidenceLabel',
+	'confusion_matrix',
+	'derive_gold_status',
+	'hit_metrics',
 	'EvidenceMatch',
 	'EvidenceNode',
 	'EvidenceRerankingError',
@@ -90,6 +118,8 @@ __all__ = [
 	'PipelineStage',
 	'JsonlEvidenceStore',
 	'MarkdownReportRenderer',
+	'load_benchmark_cases',
+	'macro_f1',
 	'RawSemanticEvidenceScore',
 	'RawSemanticReranking',
 	'RawClaim',

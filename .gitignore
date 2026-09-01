@@ -28,6 +28,7 @@ dist/
 *.json
 !/server.json
 *.jsonl
+!benchmarks/webevidence/*.jsonl
 *.log
 *.bak
 
