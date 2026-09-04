@@ -28,6 +28,7 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from browser_use.evidence.claims import NonBlankString
 from browser_use.evidence.pipeline import WebEvidencePipelineResult
+from browser_use.evidence.retrying_llm import LLMRetryStats
 from browser_use.evidence.verification import VerificationStatus
 
 # Pattern matching happens on normalized text, so dataset patterns are written in plain lowercase.
@@ -209,6 +210,13 @@ class BrowserBenchmarkRunResult(BaseModel):
 	combined score is offered. Evidence counts, timings and step counts ride along because a failure that
 	produced no evidence at all is a different story from one that produced thirty nodes and verified none
 	of them. No answer text, page content, screenshot or credential is kept here.
+
+	The ``postprocess_llm_*`` counters are the retry telemetry of one run, in the shape described by
+	:func:`browser_use.evidence.retrying_llm.stats_delta`: a difference measured across that run, never a
+	total accumulated since the benchmark started, because one wrapper is shared by every run. They are
+	``None`` when the pipeline never started, since no post-processing call was made to count, and that is
+	not the same claim as ``0``. A pipeline that ran cleanly reports ``postprocess_llm_retry_count=0``, and
+	a pipeline that died still reports the attempts it spent before it died.
 	"""
 
 	case_id: str = Field(description='BrowserBenchmarkCase.case_id')
@@ -238,6 +246,21 @@ class BrowserBenchmarkRunResult(BaseModel):
 	)
 	agent_elapsed_seconds: float | None = Field(default=None, ge=0.0, description='Wall clock of the browser run')
 	pipeline_elapsed_seconds: float | None = Field(default=None, ge=0.0, description='Wall clock of the post-processing')
+	postprocess_llm_logical_calls: int | None = Field(
+		default=None, ge=0, description='Post-processing calls this run asked for; None when the pipeline never started'
+	)
+	postprocess_llm_attempts: int | None = Field(
+		default=None, ge=0, description='Post-processing calls that actually reached the provider'
+	)
+	postprocess_llm_retry_count: int | None = Field(
+		default=None, ge=0, description='Extra attempts made after a failed attempt, 0 for a run that never retried'
+	)
+	postprocess_llm_recovered_calls: int | None = Field(
+		default=None, ge=0, description='Calls that succeeded only because an earlier attempt was retried'
+	)
+	postprocess_llm_failed_calls: int | None = Field(
+		default=None, ge=0, description='Calls that ran out of attempts and re-raised'
+	)
 	failure_stage: BrowserBenchmarkFailureStage | None = Field(default=None, description='Where the run stopped, if it did')
 	failure_type: str | None = Field(default=None, description='Exception type name only, never its message')
 	report_json_path: str | None = Field(default=None, description='Where report.json was written for this run')
@@ -258,6 +281,17 @@ class BrowserBenchmarkRunResult(BaseModel):
 			if self.failure_stage is not BrowserBenchmarkFailureStage.OUTPUT_WRITE:
 				# Only a failed write can follow a completed pipeline: the analysis exists, the artifact does not.
 				raise ValueError(f'run {self.case_id!r} both failed at {self.failure_stage.value} and completed the pipeline')
+		telemetry = (
+			self.postprocess_llm_logical_calls,
+			self.postprocess_llm_attempts,
+			self.postprocess_llm_retry_count,
+			self.postprocess_llm_recovered_calls,
+			self.postprocess_llm_failed_calls,
+		)
+		if any(value is None for value in telemetry) and not all(value is None for value in telemetry):
+			# The counters only make sense as one delta, and a half-filled record would feed a phantom zero
+			# into the summary totals.
+			raise ValueError(f'run {self.case_id!r} has partial post-processing retry telemetry')
 		return self
 
 
@@ -292,6 +326,28 @@ def run_result_with_pipeline(
 	)
 
 
+def run_result_with_retry_stats(
+	run: BrowserBenchmarkRunResult,
+	stats: LLMRetryStats,
+) -> BrowserBenchmarkRunResult:
+	"""Copy a run record with retry telemetry taken from the counters of one wrapper.
+
+	``stats`` is expected to be a delta produced by :func:`browser_use.evidence.retrying_llm.stats_delta`
+	for this run alone. Pass a cumulative snapshot instead and every run would report the whole benchmark's
+	running total, which is the failure mode the per-run snapshots exist to prevent. The exception type
+	counts stay out of the record: they name nothing the aggregate needs.
+	"""
+	return run.model_copy(
+		update={
+			'postprocess_llm_logical_calls': stats.logical_invocation_count,
+			'postprocess_llm_attempts': stats.attempt_count,
+			'postprocess_llm_retry_count': stats.retry_count,
+			'postprocess_llm_recovered_calls': stats.recovered_invocation_count,
+			'postprocess_llm_failed_calls': stats.failed_invocation_count,
+		}
+	)
+
+
 def _rate(values: Sequence[bool | None]) -> float | None:
 	"""Mean over the values that were measured, or None when none were."""
 	measured = [value for value in values if value is not None]
@@ -305,6 +361,14 @@ def _mean(values: Iterable[float | None]) -> float | None:
 	if not measured:
 		return None
 	return sum(measured) / len(measured)
+
+
+def _total(values: Iterable[int | None]) -> int | None:
+	"""Sum over the values that were measured, or None when none were."""
+	measured = [value for value in values if value is not None]
+	if not measured:
+		return None
+	return sum(measured)
 
 
 def _unique(values: Sequence[str]) -> list[str]:
@@ -324,6 +388,12 @@ class BrowserBenchmarkSummary(BaseModel):
 	Averaging per-run rates would let a run with one claim weigh as much as a run with eight, which hides
 	exactly the pattern this benchmark looks for: a few unsupported claims inside otherwise solid answers.
 	A ``None`` rate means nothing was measured, never that it scored zero.
+
+	The retry totals add up the per-run post-processing counters over the runs that reported them, so a
+	``None`` there means no run reported telemetry, not that the pipeline made no calls. Exception type
+	counts stay out of these totals deliberately. ``runs_recovered_by_retry_count`` is an observed count,
+	not a counterfactual: it says a call in that run failed once and then succeeded, never that the run
+	would have failed without retry.
 	"""
 
 	run_count: int = Field(default=0, ge=0, description='Runs aggregated')
@@ -348,6 +418,25 @@ class BrowserBenchmarkSummary(BaseModel):
 	mean_agent_elapsed_seconds: float | None = Field(default=None, ge=0.0)
 	mean_pipeline_elapsed_seconds: float | None = Field(default=None, ge=0.0)
 	total_claims_verified: int = Field(default=0, ge=0, description='Pooled claim count, the denominator of the claim rates')
+	total_postprocess_llm_logical_calls: int | None = Field(
+		default=None, ge=0, description='Post-processing calls asked for, summed over runs that reported telemetry'
+	)
+	total_postprocess_llm_attempts: int | None = Field(
+		default=None, ge=0, description='Provider calls actually made for post-processing, same denominator'
+	)
+	total_postprocess_llm_retries: int | None = Field(default=None, ge=0, description='Extra attempts spent across those runs')
+	total_postprocess_llm_recovered_calls: int | None = Field(
+		default=None, ge=0, description='Calls that succeeded only after a retry, across those runs'
+	)
+	total_postprocess_llm_failed_calls: int | None = Field(
+		default=None, ge=0, description='Calls that ran out of attempts, across those runs'
+	)
+	runs_with_postprocess_retry_count: int = Field(
+		default=0, ge=0, description='Runs that spent at least one extra attempt, completed or not'
+	)
+	runs_recovered_by_retry_count: int = Field(
+		default=0, ge=0, description='Completed runs in which at least one call recovered through retry'
+	)
 	answer_pass_but_not_fully_supported_case_ids: list[str] = Field(
 		default_factory=list, description='Task passed the checker while some claim lacked full support'
 	)
@@ -373,6 +462,10 @@ def summarize_browser_runs(runs: Sequence[BrowserBenchmarkRunResult]) -> Browser
 	claim rates over the pooled claims of pipeline-complete runs, and ``fully_supported`` over runs whose
 	pipeline finished. Those denominators differ on purpose, since a run that never answered cannot fail a
 	task check it was never given.
+
+	The retry totals are the exception to that pattern: they cover every run that reported telemetry, which
+	includes a run that spent three attempts and still failed. That is the number the phase is about, and
+	dropping it from the total would make a retrying benchmark look cheaper than it was.
 	"""
 	verified = [run for run in runs if run.pipeline_completed and run.claim_count is not None]
 	total_claims = sum(run.claim_count or 0 for run in verified)
@@ -408,6 +501,15 @@ def summarize_browser_runs(runs: Sequence[BrowserBenchmarkRunResult]) -> Browser
 		mean_agent_elapsed_seconds=_mean([run.agent_elapsed_seconds for run in runs]),
 		mean_pipeline_elapsed_seconds=_mean([run.pipeline_elapsed_seconds for run in runs]),
 		total_claims_verified=total_claims,
+		total_postprocess_llm_logical_calls=_total([run.postprocess_llm_logical_calls for run in runs]),
+		total_postprocess_llm_attempts=_total([run.postprocess_llm_attempts for run in runs]),
+		total_postprocess_llm_retries=_total([run.postprocess_llm_retry_count for run in runs]),
+		total_postprocess_llm_recovered_calls=_total([run.postprocess_llm_recovered_calls for run in runs]),
+		total_postprocess_llm_failed_calls=_total([run.postprocess_llm_failed_calls for run in runs]),
+		runs_with_postprocess_retry_count=sum(1 for run in runs if (run.postprocess_llm_retry_count or 0) > 0),
+		runs_recovered_by_retry_count=sum(
+			1 for run in runs if run.pipeline_completed and (run.postprocess_llm_recovered_calls or 0) > 0
+		),
 		answer_pass_but_not_fully_supported_case_ids=_unique(
 			[run.case_id for run in runs if run.answer_check_passed is True and run.fully_supported is False]
 		),

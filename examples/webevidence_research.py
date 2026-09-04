@@ -22,6 +22,12 @@ mainland account also needs ``ALIBABA_CLOUD_BASE_URL=https://dashscope.aliyuncs.
 Usage::
 
     uv run python examples/webevidence_research.py --task "Find the Browser Use GitHub repository and report its primary language."
+    uv run python examples/webevidence_research.py --task "..." --postprocess-max-attempts 1
+
+Only the three post-processing stages run through a bounded retry wrapper. The agent keeps the plain
+model, because Phase 9B found the transient failures in claim extraction, reranking and verification,
+not in browsing, and leaving the browser half untouched keeps that comparison honest. Setting
+``--postprocess-max-attempts 1`` turns retry off and reproduces the Phase 9B behaviour.
 
 This demo opens a browser and spends real model calls, so it is not part of the automated test suite:
 ``pytest`` never runs anything in ``examples/``, and the pipeline's own tests use a fake model.
@@ -34,9 +40,15 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
+from pydantic import ValidationError
 from uuid_extensions import uuid7str
 
 load_dotenv()
+
+# The report markdown carries emoji, and redirected output gets the locale codepage, which is cp936 on
+# Windows and cannot encode them. Setting this here rather than in main() means every printing path,
+# including a caller importing this module, has the same permission the report writers already have.
+sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
 from browser_use import Agent, Browser, ChatOpenAI
 from browser_use.evidence import (
@@ -48,12 +60,16 @@ from browser_use.evidence import (
 	EvidenceOrganizer,
 	EvidenceReportBuilder,
 	JsonlEvidenceStore,
+	LLMRetryPolicy,
+	LLMRetryStats,
 	MarkdownReportRenderer,
+	RetryingChatModel,
 	SemanticEvidenceReranker,
 	WebEvidencePipeline,
 	WebEvidencePipelineError,
 	WebEvidencePipelineResult,
 )
+from browser_use.llm.base import BaseChatModel
 
 # The model under evaluation. Kept fixed on purpose: this demo exists to show what this model does, so
 # it must not quietly fall back to a different one when a stage struggles.
@@ -67,8 +83,12 @@ DEFAULT_TASK = 'Find the official Browser Use GitHub repository and report wheth
 OUTPUT_ROOT = Path('tmp') / 'webevidence'
 
 
-def build_pipeline(llm: ChatOpenAI) -> WebEvidencePipeline:
-	"""Wire Phases 3 to 7 with the same client everywhere, injected so nothing here builds a provider."""
+def build_pipeline(llm: BaseChatModel) -> WebEvidencePipeline:
+	"""Wire Phases 3 to 7 with the same client everywhere, injected so nothing here builds a provider.
+
+	Each stage takes a ``BaseChatModel``, so the caller decides whether that model retries. Nothing in
+	Phases 3 to 7 knows the difference.
+	"""
 	return WebEvidencePipeline(
 		claim_extractor=ClaimExtractor(llm),
 		aligner=EvidenceAligner(top_k=5),
@@ -143,7 +163,17 @@ def write_outputs(result: WebEvidencePipelineResult, run_dir: Path) -> tuple[Pat
 	return report_json, report_md, pipeline_result
 
 
-def print_summary(result: WebEvidencePipelineResult, paths: tuple[Path, Path, Path]) -> None:
+def print_retry_stats(stats: LLMRetryStats) -> None:
+	"""What the post-processing calls cost. Counts only, because a provider message can echo the answer."""
+	print('post-processing LLM retry:')
+	print(f'  logical calls: {stats.logical_invocation_count}')
+	print(f'  provider attempts: {stats.attempt_count}')
+	print(f'  retries: {stats.retry_count}')
+	print(f'  recovered calls: {stats.recovered_invocation_count}')
+	print(f'  failed calls: {stats.failed_invocation_count}')
+
+
+def print_summary(result: WebEvidencePipelineResult, paths: tuple[Path, Path, Path], retry_stats: LLMRetryStats) -> None:
 	"""Report what happened, in the order a reader asks for it. Never prints a key or raw page content."""
 	summary = result.report.summary
 	print(f'task_id: {result.task_id}')
@@ -160,6 +190,7 @@ def print_summary(result: WebEvidencePipelineResult, paths: tuple[Path, Path, Pa
 		('NO_EVIDENCE', summary.no_evidence_claim_count),
 	):
 		print(f'  {label}: {count}')
+	print_retry_stats(retry_stats)
 	print(f'report.json: {paths[0]}')
 	print(f'report.md: {paths[1]}')
 	print(f'pipeline_result.json: {paths[2]}')
@@ -180,7 +211,31 @@ async def main() -> int:
 		help='Skip the ad-block and cookie-banner extensions, for networks that cannot reach their CDN.',
 	)
 	parser.add_argument('--debug', action='store_true', help='Re-raise pipeline errors with their original traceback.')
+	parser.add_argument(
+		'--postprocess-max-attempts',
+		type=int,
+		default=3,
+		help='Total post-processing model attempts per call, so 3 means two retries; 1 turns retry off.',
+	)
+	parser.add_argument(
+		'--postprocess-retry-delay',
+		type=float,
+		default=1.0,
+		help='Seconds before the first post-processing retry, doubling up to an 8s ceiling.',
+	)
 	args = parser.parse_args()
+
+	try:
+		retry_policy = LLMRetryPolicy(
+			max_attempts=args.postprocess_max_attempts, initial_delay_seconds=args.postprocess_retry_delay
+		)
+	except ValidationError:
+		# Before the key check, so this message is never masked by an unrelated one.
+		print(
+			'--postprocess-max-attempts must be at least 1, and --postprocess-retry-delay must not exceed the 8s ceiling',
+			file=sys.stderr,
+		)
+		return 1
 
 	api_key = os.getenv(API_KEY_ENV)
 	if not api_key:
@@ -188,7 +243,11 @@ async def main() -> int:
 
 	base_url = os.getenv(BASE_URL_ENV) or DEFAULT_BASE_URL
 	llm = ChatOpenAI(model=MODEL, api_key=api_key, base_url=base_url, temperature=0.0)
+	# The wrapper re-asks the same client rather than falling back to another one, and the agent above stays
+	# unwrapped so browsing behaves exactly as it did before Phase 9C.
+	postprocess_llm = RetryingChatModel(llm, policy=retry_policy)
 	print(f'model: {MODEL} via {base_url}')
+	print(f'post-processing retry: {retry_policy.max_attempts} attempts per call')
 
 	task_id = uuid7str()
 	run_dir = OUTPUT_ROOT / task_id
@@ -219,16 +278,20 @@ async def main() -> int:
 		return 1
 
 	try:
-		result = await build_pipeline(llm).analyze(task_id=task_id, task=args.task, answer=answer, evidence_nodes=nodes)
+		result = await build_pipeline(postprocess_llm).analyze(
+			task_id=task_id, task=args.task, answer=answer, evidence_nodes=nodes
+		)
 	except WebEvidencePipelineError as e:
 		# The pipeline message is safe to print: it names the stage and the exception type only. The
 		# original exception stays available under --debug for whoever is fixing it.
 		print(f'pipeline failed at {e.stage.value}: {type(e.__cause__).__name__}', file=sys.stderr)
+		# The attempts this run spent are part of what failed, so report them before stopping.
+		print_retry_stats(postprocess_llm.snapshot_stats())
 		if args.debug:
 			raise
 		return 1
 
-	print_summary(result, write_outputs(result, run_dir))
+	print_summary(result, write_outputs(result, run_dir), postprocess_llm.snapshot_stats())
 	return 0
 
 

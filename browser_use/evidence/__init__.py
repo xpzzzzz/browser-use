@@ -38,6 +38,7 @@ from browser_use.evidence.e2e_benchmark import (
 	load_browser_benchmark_cases,
 	normalize_answer_text,
 	run_result_with_pipeline,
+	run_result_with_retry_stats,
 	summarize_browser_runs,
 )
 from browser_use.evidence.models import EvidenceNode
@@ -76,6 +77,12 @@ from browser_use.evidence.reranking import (
 	RerankedEvidenceMatch,
 	RerankingResult,
 	SemanticEvidenceReranker,
+)
+from browser_use.evidence.retrying_llm import (
+	LLMRetryPolicy,
+	LLMRetryStats,
+	RetryingChatModel,
+	stats_delta,
 )
 from browser_use.evidence.store import JsonlEvidenceStore
 from browser_use.evidence.verification import (
@@ -143,11 +150,15 @@ __all__ = [
 	'EvidenceReportError',
 	'PipelineStage',
 	'JsonlEvidenceStore',
+	'LLMRetryPolicy',
+	'LLMRetryStats',
 	'MarkdownReportRenderer',
 	'load_benchmark_cases',
 	'macro_f1',
 	'run_result_with_pipeline',
+	'run_result_with_retry_stats',
 	'summarize_browser_runs',
+	'stats_delta',
 	'RawSemanticEvidenceScore',
 	'RawSemanticReranking',
 	'RawClaim',
@@ -157,6 +168,7 @@ __all__ = [
 	'ReportClaimEvidence',
 	'ReportEvidenceSource',
 	'ReportSummary',
+	'RetryingChatModel',
 	'SemanticEvidenceReranker',
 	'ClaimReportSection',
 	'VerificationResult',

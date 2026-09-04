@@ -13,11 +13,17 @@ since the pipeline never rewrites the answer, what this measures is failure visi
 Setup: ``ALIBABA_CLOUD`` in the environment or in the repo ``.env``, plus ``ALIBABA_CLOUD_BASE_URL`` for
 a region-scoped key (a mainland account needs ``https://dashscope.aliyuncs.com/compatible-mode/v1``).
 
+The agent runs on the plain ``ChatOpenAI`` client and only the post-processing stages run through
+:class:`~browser_use.evidence.retrying_llm.RetryingChatModel`. Phase 9B showed browsing was already
+reliable and post-processing was not, so keeping the browser half un-retried is what makes the retry
+numbers attributable to the stage that changed.
+
 Examples::
 
 	python scripts/run_webevidence_browser_benchmark.py --case example-heading
 	python scripts/run_webevidence_browser_benchmark.py --limit 2
 	python scripts/run_webevidence_browser_benchmark.py --repeats 2 --headful
+	python scripts/run_webevidence_browser_benchmark.py --repeats 2 --postprocess-max-attempts 1
 
 Runs are sequential, and each gets its own browser profile and evidence store under ``tmp/``. This script
 is the live half of Phase 9B: nothing in the test suite starts a browser or calls a model.
@@ -31,6 +37,7 @@ import time
 from pathlib import Path
 
 from dotenv import load_dotenv
+from pydantic import ValidationError
 from uuid_extensions import uuid7str
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,9 +53,12 @@ from browser_use.evidence import (
 	EvidenceOrganizer,
 	EvidenceReportBuilder,
 	JsonlEvidenceStore,
+	LLMRetryPolicy,
 	MarkdownReportRenderer,
+	RetryingChatModel,
 	SemanticEvidenceReranker,
 	WebEvidencePipeline,
+	stats_delta,
 )
 from browser_use.evidence.e2e_benchmark import (
 	AnswerCheck,
@@ -60,8 +70,10 @@ from browser_use.evidence.e2e_benchmark import (
 	evaluate_answer,
 	load_browser_benchmark_cases,
 	run_result_with_pipeline,
+	run_result_with_retry_stats,
 	summarize_browser_runs,
 )
+from browser_use.llm.base import BaseChatModel
 
 MODEL = 'qwen3.8-flash'
 API_KEY_ENV = 'ALIBABA_CLOUD'
@@ -82,6 +94,14 @@ def positive_int(raw: str) -> int:
 	return value
 
 
+def non_negative_float(raw: str) -> float:
+	"""A negative delay is not a wait at all, and the policy rejects it with a longer message."""
+	value = float(raw)
+	if value < 0:
+		raise argparse.ArgumentTypeError('must be at least 0')
+	return value
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description=__doc__.splitlines()[0], formatter_class=argparse.RawDescriptionHelpFormatter)
 	parser.add_argument('--dataset', type=Path, default=DEFAULT_DATASET, help='JSONL browser task dataset')
@@ -98,6 +118,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 	parser.add_argument('--case', action='append', help='run only this case id, repeatable')
 	parser.add_argument('--limit', type=positive_int, help='run only the first N cases')
 	parser.add_argument('--repeats', type=positive_int, default=1, help='independent runs per case, to observe variance')
+	parser.add_argument(
+		'--postprocess-max-attempts',
+		type=positive_int,
+		default=3,
+		help='total post-processing model attempts per call, so 3 means two retries; 1 turns retry off',
+	)
+	parser.add_argument(
+		'--postprocess-retry-delay',
+		type=non_negative_float,
+		default=1.0,
+		help='seconds before the first post-processing retry, doubling up to an 8s ceiling',
+	)
 	return parser.parse_args(argv)
 
 
@@ -117,8 +149,12 @@ def select_cases(cases: list[BrowserBenchmarkCase], only: list[str] | None, limi
 	return cases
 
 
-def build_pipeline(llm: ChatOpenAI) -> WebEvidencePipeline:
-	"""Wire Phases 3 to 7 once and reuse the same client the agent used."""
+def build_pipeline(llm: BaseChatModel) -> WebEvidencePipeline:
+	"""Wire Phases 3 to 7 once and reuse the same client the agent used.
+
+	The stages take a ``BaseChatModel``, so whether that model retries is decided by what the caller passes
+	in here, not by anything the stages know about.
+	"""
 	return WebEvidencePipeline(
 		claim_extractor=ClaimExtractor(llm),
 		aligner=EvidenceAligner(top_k=5),
@@ -178,6 +214,7 @@ async def run_case(
 	*,
 	repeat: int,
 	llm: ChatOpenAI,
+	postprocess_llm: RetryingChatModel,
 	output_root: Path,
 	headless: bool,
 	extensions: bool,
@@ -186,6 +223,8 @@ async def run_case(
 
 	The result carries the raw task check and the claim-level observation from the same trajectory, and a
 	failure leaves the later fields ``None`` rather than inventing a value for a stage that never ran.
+	Retry telemetry is a snapshot difference across this run only: one wrapper serves the whole benchmark,
+	so its running totals would otherwise be copied onto every record.
 	"""
 	run_dir = output_root / case.case_id / f'run-{repeat:03d}'
 	run_dir.mkdir(parents=True, exist_ok=True)
@@ -269,14 +308,23 @@ async def run_case(
 		flush=True,
 	)
 
+	stats_before_pipeline = postprocess_llm.snapshot_stats()
 	try:
 		pipeline_started = time.perf_counter()
-		result = await build_pipeline(llm).analyze(task_id=task_id, task=case.task, answer=answer or '', evidence_nodes=nodes)
+		result = await build_pipeline(postprocess_llm).analyze(
+			task_id=task_id, task=case.task, answer=answer or '', evidence_nodes=nodes
+		)
 		pipeline_elapsed = time.perf_counter() - pipeline_started
 	except Exception as e:
+		# Attempts spent before a failure are part of the run's cost, so record them, then fail exactly as
+		# Phase 9B did: the stage error still ends the run and still names its stage.
+		run = run_result_with_retry_stats(run, stats_delta(stats_before_pipeline, postprocess_llm.snapshot_stats()))
 		return _record_failure(run, BrowserBenchmarkFailureStage.PIPELINE, e)
 
-	run = run_result_with_pipeline(run, result).model_copy(update={'pipeline_elapsed_seconds': round(pipeline_elapsed, 3)})
+	run = run_result_with_retry_stats(
+		run_result_with_pipeline(run, result).model_copy(update={'pipeline_elapsed_seconds': round(pipeline_elapsed, 3)}),
+		stats_delta(stats_before_pipeline, postprocess_llm.snapshot_stats()),
+	)
 
 	try:
 		report_json, report_markdown = _write_artifacts(run_dir, result.report, result.markdown)
@@ -294,7 +342,8 @@ async def run_case(
 
 	print(
 		f'  {case.case_id} run-{repeat:03d}: claims={summary.claim_count} supported={summary.supported_claim_count} '
-		f'no_evidence={summary.no_evidence_claim_count} fully_supported={run.fully_supported}',
+		f'no_evidence={summary.no_evidence_claim_count} fully_supported={run.fully_supported} '
+		f'retries={run.postprocess_llm_retry_count} recovered={run.postprocess_llm_recovered_calls}',
 		flush=True,
 	)
 	return run
@@ -310,6 +359,14 @@ def print_summary(result: EvidenceBrowserBenchmarkResult, *, dataset: Path, outp
 	_print('Final answer rate', summary.final_answer_rate)
 	_print('Answer check pass', summary.answer_check_pass_rate)
 	_print('Pipeline completion', summary.pipeline_completion_rate)
+	print('Post-processing LLM retry:')
+	print(f'  logical calls: {_count(summary.total_postprocess_llm_logical_calls)}')
+	print(f'  provider attempts: {_count(summary.total_postprocess_llm_attempts)}')
+	print(f'  retries: {_count(summary.total_postprocess_llm_retries)}')
+	print(f'  recovered calls: {_count(summary.total_postprocess_llm_recovered_calls)}')
+	print(f'  failed calls: {_count(summary.total_postprocess_llm_failed_calls)}')
+	print(f'  runs with retry: {summary.runs_with_postprocess_retry_count}')
+	print(f'  runs recovered by retry: {summary.runs_recovered_by_retry_count}')
 	print(f'Mean browser steps: {_num(summary.mean_browser_steps)}')
 	print(f'Mean evidence count: {_num(summary.mean_evidence_count)}')
 	print(f'Mean claim count: {_num(summary.mean_claim_count)}')
@@ -351,8 +408,21 @@ def _num(value: float | None) -> str:
 	return 'unavailable' if value is None else f'{value:.2f}'
 
 
+def _count(value: int | None) -> str:
+	"""No telemetry is not the same claim as a total of zero."""
+	return 'unavailable' if value is None else str(value)
+
+
 async def main(argv: list[str] | None = None) -> int:
 	args = parse_args(argv)
+	try:
+		retry_policy = LLMRetryPolicy(
+			max_attempts=args.postprocess_max_attempts, initial_delay_seconds=args.postprocess_retry_delay
+		)
+	except ValidationError:
+		# Before the dataset read and the key check, so this message is never masked by an unrelated one.
+		print('--postprocess-retry-delay must not exceed the 8s retry ceiling', file=sys.stderr)
+		return 1
 	# A relative --output-dir means "relative to the repository", so recorded paths stay meaningful.
 	if not args.output_dir.is_absolute():
 		args.output_dir = ROOT / args.output_dir
@@ -371,7 +441,13 @@ async def main(argv: list[str] | None = None) -> int:
 	base_url = os.getenv(BASE_URL_ENV) or DEFAULT_BASE_URL
 	# One client shared by the agent and every pipeline stage, sequentially, as the Phase 8 demo proved.
 	llm = ChatOpenAI(model=MODEL, api_key=api_key, base_url=base_url, temperature=0.0)
+	# The wrapper adds attempts to a call; it never changes which model answers. Only post-processing is
+	# wrapped so the browsing baseline stays what Phase 9B measured, and one wrapper instance serves every
+	# run, which is why each run records a snapshot difference instead of its totals.
+	postprocess_llm = RetryingChatModel(llm, policy=retry_policy)
 	print(f'model: {MODEL} via {base_url}')
+	delays = ', '.join(f'{delay}s' for delay in retry_policy.retry_delays()) or 'retry disabled'
+	print(f'post-processing retry: {retry_policy.max_attempts} attempts per call, delays: {delays}')
 	print(f'cases: {", ".join(case.case_id for case in cases)}')
 	print(f'repeats per case: {args.repeats}')
 
@@ -383,6 +459,7 @@ async def main(argv: list[str] | None = None) -> int:
 				case,
 				repeat=repeat,
 				llm=llm,
+				postprocess_llm=postprocess_llm,
 				output_root=args.output_dir,
 				headless=not args.headful,
 				extensions=args.extensions,

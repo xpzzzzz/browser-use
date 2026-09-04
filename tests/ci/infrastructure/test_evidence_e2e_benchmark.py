@@ -15,9 +15,11 @@ from browser_use.evidence import (
 	ClaimSet,
 	EvidenceGraph,
 	EvidenceRelation,
+	LLMRetryStats,
 	RerankingResult,
 	VerificationResult,
 	VerificationStatus,
+	stats_delta,
 )
 from browser_use.evidence.e2e_benchmark import (
 	AnswerCheck,
@@ -32,6 +34,7 @@ from browser_use.evidence.e2e_benchmark import (
 	load_browser_benchmark_cases,
 	normalize_answer_text,
 	run_result_with_pipeline,
+	run_result_with_retry_stats,
 	summarize_browser_runs,
 )
 from browser_use.evidence.pipeline import WebEvidencePipelineResult
@@ -154,6 +157,32 @@ def _pipeline_result(statuses: list[VerificationStatus], evidence_count: int = 2
 		report=report,
 		markdown='# report',
 	)
+
+
+_TELEMETRY_FIELDS = (
+	'postprocess_llm_logical_calls',
+	'postprocess_llm_attempts',
+	'postprocess_llm_retry_count',
+	'postprocess_llm_recovered_calls',
+	'postprocess_llm_failed_calls',
+)
+
+
+def _retry_telemetry(
+	*, logical: int = 3, attempts: int = 3, retries: int = 0, recovered: int = 0, failed: int = 0
+) -> dict[str, int]:
+	"""The five counters as keyword arguments.
+
+	The defaults are a single-claim run that asked for one extraction, one reranking and one verification
+	and got all three on the first attempt, so a test states only the interesting part.
+	"""
+	return {
+		'postprocess_llm_logical_calls': logical,
+		'postprocess_llm_attempts': attempts,
+		'postprocess_llm_retry_count': retries,
+		'postprocess_llm_recovered_calls': recovered,
+		'postprocess_llm_failed_calls': failed,
+	}
 
 
 class TestCaseModel:
@@ -360,6 +389,128 @@ class TestPipelineProjection:
 		assert filled.claim_count == 0
 		assert filled.fully_supported is False
 		assert filled.pipeline_completed
+
+
+class TestRetryTelemetry:
+	def test_a_run_that_never_reached_the_pipeline_has_nothing_to_count(self):
+		"""None, not 0: no post-processing call was made, which is a different claim from making three cleanly."""
+		run = _failed_run('c1', BrowserBenchmarkFailureStage.AGENT_RUN, 'TimeoutError')
+
+		assert all(getattr(run, field) is None for field in _TELEMETRY_FIELDS)
+
+	def test_a_partial_counter_block_is_refused(self):
+		"""A single filled counter would feed a phantom zero into the summary totals."""
+		block = _retry_telemetry()
+		block.pop('postprocess_llm_failed_calls')
+
+		with pytest.raises(Exception, match='partial post-processing retry telemetry'):
+			_run(**block)
+
+	def test_a_clean_run_reports_zero_retries_as_zero(self):
+		summary = summarize_browser_runs([_run(**_retry_telemetry())])
+
+		assert summary.total_postprocess_llm_logical_calls == 3
+		assert summary.total_postprocess_llm_attempts == 3
+		assert summary.total_postprocess_llm_retries == 0
+		assert summary.total_postprocess_llm_recovered_calls == 0
+		assert summary.runs_with_postprocess_retry_count == 0
+		assert summary.runs_recovered_by_retry_count == 0
+
+	def test_the_counters_pool_over_the_runs_that_reported_them(self):
+		runs = [
+			_run(case_id='retried', **_retry_telemetry(logical=3, attempts=5, retries=2, recovered=2)),
+			_run(case_id='clean', **_retry_telemetry(logical=4, attempts=4)),
+		]
+
+		summary = summarize_browser_runs(runs)
+
+		assert summary.total_postprocess_llm_logical_calls == 7
+		assert summary.total_postprocess_llm_attempts == 9
+		assert summary.total_postprocess_llm_retries == 2
+		assert summary.total_postprocess_llm_recovered_calls == 2
+		assert summary.total_postprocess_llm_failed_calls == 0
+		assert summary.runs_with_postprocess_retry_count == 1
+		assert summary.runs_recovered_by_retry_count == 1
+
+	def test_no_run_reported_telemetry_so_the_totals_stay_none(self):
+		summary = summarize_browser_runs([_run(), _failed_run('c2', BrowserBenchmarkFailureStage.PIPELINE, 'X')])
+
+		for field in (
+			'total_postprocess_llm_logical_calls',
+			'total_postprocess_llm_attempts',
+			'total_postprocess_llm_retries',
+			'total_postprocess_llm_recovered_calls',
+			'total_postprocess_llm_failed_calls',
+		):
+			assert getattr(summary, field) is None, field
+		assert summary.runs_with_postprocess_retry_count == 0
+
+	def test_the_projection_fills_the_counters_and_leaves_the_rest_alone(self):
+		run = _run(pipeline_completed=False, claim_count=None, fully_supported=None)
+		before = deepcopy(run)
+
+		filled = run_result_with_retry_stats(
+			run,
+			LLMRetryStats(
+				logical_invocation_count=3,
+				attempt_count=6,
+				retry_count=3,
+				recovered_invocation_count=2,
+				failed_invocation_count=1,
+				exception_type_counts={'TimeoutError': 3},
+			),
+		)
+
+		assert run == before
+		assert (filled.postprocess_llm_logical_calls, filled.postprocess_llm_attempts) == (3, 6)
+		assert (filled.postprocess_llm_retry_count, filled.postprocess_llm_recovered_calls) == (3, 2)
+		assert filled.postprocess_llm_failed_calls == 1
+		assert filled.claim_count is None and not filled.pipeline_completed
+
+	def test_an_exception_type_name_never_reaches_the_shared_artifact(self):
+		"""The record is the file that gets handed around, so it carries counts and nothing else."""
+		filled = run_result_with_retry_stats(
+			_run(**_retry_telemetry()),
+			LLMRetryStats(logical_invocation_count=1, attempt_count=3, retry_count=2, exception_type_counts={'TimeoutError': 2}),
+		)
+		dumped = filled.model_dump_json()
+
+		assert 'TimeoutError' not in dumped
+		assert 'exception_type' not in dumped
+
+	def test_a_run_records_its_own_delta_not_the_shared_wrappers_total(self):
+		"""One wrapper serves every run, so the pair of snapshots has to be subtracted before it is stored."""
+		before = LLMRetryStats(logical_invocation_count=2, attempt_count=4, retry_count=2, recovered_invocation_count=2)
+		after = LLMRetryStats(
+			logical_invocation_count=5,
+			attempt_count=9,
+			retry_count=4,
+			recovered_invocation_count=4,
+			failed_invocation_count=1,
+		)
+
+		run = run_result_with_retry_stats(_run(**_retry_telemetry()), stats_delta(before, after))
+
+		assert (run.postprocess_llm_logical_calls, run.postprocess_llm_attempts, run.postprocess_llm_retry_count) == (3, 5, 2)
+		assert run.postprocess_llm_logical_calls != after.logical_invocation_count
+
+	def test_a_run_that_failed_after_retrying_still_pays_for_its_attempts(self):
+		"""Retry visibility, not softening: the stage failure owns the run and its attempts stay in the totals."""
+		run = run_result_with_retry_stats(
+			_failed_run('broken', BrowserBenchmarkFailureStage.PIPELINE, 'WebEvidencePipelineError:CLAIM_EXTRACTION'),
+			LLMRetryStats(logical_invocation_count=1, attempt_count=3, retry_count=2, failed_invocation_count=1),
+		)
+
+		assert not run.pipeline_completed
+		summary = summarize_browser_runs([run])
+
+		assert summary.total_postprocess_llm_attempts == 3
+		assert summary.total_postprocess_llm_retries == 2
+		assert summary.total_postprocess_llm_failed_calls == 1
+		assert summary.runs_with_postprocess_retry_count == 1
+		# Nothing recovered it, so it is not a run that retry saved.
+		assert summary.runs_recovered_by_retry_count == 0
+		assert summary.pipeline_fail_case_ids == ['broken']
 
 
 class TestSummary:
