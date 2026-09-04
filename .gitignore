@@ -29,6 +29,7 @@ dist/
 !/server.json
 *.jsonl
 !benchmarks/webevidence/*.jsonl
+!benchmarks/webevidence/replay/*.jsonl
 *.log
 *.bak
 
